@@ -5320,12 +5320,14 @@ if($_POST['action'] == 'replace_ns_group' && isset($_POST['subdomain_id'])) {
             throw new \RuntimeException('provider unavailable');
         }
         $client = $context['client'];
+        $providerType = strtolower(trim((string) ($context['account']['provider_type'] ?? ($context['provider_type'] ?? ''))));
         $zoneId = $sub->cloudflare_zone_id ?: ($sub->rootdomain ?? '');
         if ($zoneId === '') {
             throw new \RuntimeException('zone missing');
         }
         $targetDomain = strtolower(trim((string) ($sub->subdomain ?? '')));
-        $listPerPage = max(100, min(5000, intval($settings['client_cleanup_remote_scan_per_page'] ?? 1000)));
+        $defaultPerPage = in_array($providerType, ['powerdns', 'pdns'], true) ? 500 : 1000;
+        $listPerPage = max(100, min(5000, intval($settings['client_cleanup_remote_scan_per_page'] ?? $defaultPerPage)));
         $maxProcess = max(100, min(20000, intval($settings['client_cleanup_remote_max_process'] ?? 2000)));
         $timeBudgetMs = max(500, min(10000, intval($settings['client_cleanup_remote_time_budget_ms'] ?? 4000)));
         $deadline = microtime(true) + ($timeBudgetMs / 1000.0);
