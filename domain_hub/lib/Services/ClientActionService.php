@@ -1848,7 +1848,39 @@ class CfClientActionService
                         if (!in_array($mode, ['queue', 'sync'], true)) {
                             $mode = 'queue';
                         }
-                        if ($mode === 'queue') {
+                        $forceQueueByLargeZone = false;
+                        if ($mode === 'sync') {
+                            try {
+                                list($syncCf, $syncProviderError, $syncProviderContext) = cfmod_client_acquire_provider_for_subdomain($sub, $module_settings);
+                                if ($syncCf) {
+                                    $providerType = strtolower(trim((string) ($syncProviderContext['account']['provider_type'] ?? ($syncProviderContext['provider_type'] ?? ''))));
+                                    $isPdns = ($providerType === 'powerdns' || $providerType === 'pdns')
+                                        || (is_object($syncCf) && stripos(get_class($syncCf), 'powerdns') !== false);
+                                    if ($isPdns && method_exists($syncCf, 'getZoneRrsetCount')) {
+                                        $zoneThreshold = max(10000, intval($module_settings['client_sync_cleanup_pdns_zone_rrset_threshold'] ?? 50000));
+                                        $zoneId = $sub->cloudflare_zone_id ?: ($sub->rootdomain ?? '');
+                                        if ($zoneId !== '') {
+                                            $rrsetCount = intval($syncCf->getZoneRrsetCount($zoneId));
+                                            if ($rrsetCount > $zoneThreshold) {
+                                                $forceQueueByLargeZone = true;
+                                                if (function_exists('cloudflare_subdomain_log')) {
+                                                    cloudflare_subdomain_log('client_orphan_cleanup_force_queue_large_zone', [
+                                                        'subdomain' => (string) ($sub->subdomain ?? ''),
+                                                        'provider_type' => $providerType,
+                                                        'zone_id' => $zoneId,
+                                                        'rrset_count' => $rrsetCount,
+                                                        'threshold' => $zoneThreshold,
+                                                    ], intval($userid), $subdomainId);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch (\Throwable $e) {
+                            }
+                        }
+
+                        if ($mode === 'queue' || $forceQueueByLargeZone) {
                             $jobId = Capsule::table('mod_cloudflare_jobs')->insertGetId([
                                 'type' => 'client_cleanup_orphan_dns_remote',
                                 'payload_json' => json_encode([
@@ -1866,6 +1898,9 @@ class CfClientActionService
                                 CfQueueTriggerService::trigger();
                             }
                             $msg = self::actionTextByLanguage('orphan.cleanup.queue_submitted', '域名记录冲突清理任务已提交，系统将删除该域名云端全部 DNS 记录（请在10分钟后查看是否成功）。', 'Domain DNS conflict cleanup job submitted. The system will delete all provider-side DNS records for this domain (please check back in 10 minutes).');
+                            if ($forceQueueByLargeZone) {
+                                $msg .= ' ' . self::actionTextByLanguage('orphan.cleanup.large_zone_force_queue', '检测到当前根域名记录量较大，已自动切换为后台异步执行以避免页面卡顿。', 'A large zone was detected. The request has been switched to asynchronous queue mode automatically to avoid page stalls.');
+                            }
                             $msg_type = 'success';
                         } else {
                             $deletedCount = self::cleanupAllRemoteDnsForSubdomain($sub, $module_settings);
@@ -3899,7 +3934,17 @@ if($_POST['action'] == "update_dns" && isset($_POST['subdomain_id'])) {
                                 ->where('record_id', $record_id)
                                 ->first();
                         } elseif ($record_name) {
-                            $fullName = $record_name === '@' ? $record->subdomain : ($record_name . '.' . $record->subdomain);
+                            $normalizedRecordName = strtolower(trim((string) $record_name));
+                            $normalizedSubdomain = strtolower(trim((string) $record->subdomain));
+                            if ($normalizedRecordName === '' || $normalizedRecordName === '@') {
+                                $fullName = $record->subdomain;
+                            } elseif ($normalizedSubdomain !== '' && $normalizedRecordName === $normalizedSubdomain) {
+                                $fullName = $record->subdomain;
+                            } elseif ($normalizedSubdomain !== '' && substr($normalizedRecordName, -strlen('.' . $normalizedSubdomain)) === '.' . $normalizedSubdomain) {
+                                $fullName = $normalizedRecordName;
+                            } else {
+                                $fullName = $record_name . '.' . $record->subdomain;
+                            }
                             $targetRecord = Capsule::table('mod_cloudflare_dns_records')
                                 ->where('subdomain_id', $subdomain_id)
                                 ->where('name', $fullName)
@@ -3912,7 +3957,17 @@ if($_POST['action'] == "update_dns" && isset($_POST['subdomain_id'])) {
                                 $msg = $providerError;
                                 $msg_type = 'danger';
                             } else {
-                                $newFullName = ($record_name === '@') ? $record->subdomain : ($record_name . '.' . $record->subdomain);
+                                $normalizedRecordName = strtolower(trim((string) $record_name));
+                                $normalizedSubdomain = strtolower(trim((string) $record->subdomain));
+                                if ($normalizedRecordName === '' || $normalizedRecordName === '@') {
+                                    $newFullName = $record->subdomain;
+                                } elseif ($normalizedSubdomain !== '' && $normalizedRecordName === $normalizedSubdomain) {
+                                    $newFullName = $record->subdomain;
+                                } elseif ($normalizedSubdomain !== '' && substr($normalizedRecordName, -strlen('.' . $normalizedSubdomain)) === '.' . $normalizedSubdomain) {
+                                    $newFullName = $normalizedRecordName;
+                                } else {
+                                    $newFullName = $record_name . '.' . $record->subdomain;
+                                }
                                 $caa_content = null;
                                 $finalContentForCompare = $record_content;
 
@@ -4117,10 +4172,31 @@ if($_POST['action'] == "update_dns" && isset($_POST['subdomain_id'])) {
                                     }
 
                                     try {
+                                        $providerType = strtolower(trim((string) ($providerContext['account']['provider_type'] ?? ($providerContext['provider_type'] ?? ''))));
+                                        $isPdnsProvider = ($providerType === 'powerdns' || $providerType === 'pdns')
+                                            || (is_object($cf) && stripos(get_class($cf), 'powerdns') !== false);
+                                        if ($isPdnsProvider && method_exists($cf, 'setFullZoneFallbackRrsetThreshold')) {
+                                            $fallbackThreshold = max(1, intval($module_settings['self_heal_pdns_fullzone_fallback_rrset_threshold'] ?? 1));
+                                            $cf->setFullZoneFallbackRrsetThreshold($fallbackThreshold);
+                                        }
                                         $fresh = $cf->getDnsRecords($record->cloudflare_zone_id, $record->subdomain);
                                         if (($fresh['success'] ?? false)) {
+                                            $driftThreshold = max(50, min(5000, intval($module_settings['self_heal_max_remote_records_per_sync'] ?? 200)));
+                                            $freshRows = is_array($fresh['result'] ?? null) ? $fresh['result'] : [];
+                                            if (count($freshRows) > $driftThreshold) {
+                                                $queuedJobId = self::enqueueAsyncDnsJob(intval($userid ?? 0), 'update_dns');
+                                                if (function_exists('cloudflare_subdomain_log')) {
+                                                    cloudflare_subdomain_log('client_update_dns_self_heal_drift_threshold', [
+                                                        'subdomain_id' => $subdomain_id,
+                                                        'remote_count' => count($freshRows),
+                                                        'threshold' => $driftThreshold,
+                                                        'queued_job_id' => $queuedJobId,
+                                                    ], $userid, $subdomain_id);
+                                                }
+                                                throw new Exception(self::actionText('dns.async.queued', '操作已提交到后台队列，将在稍后自动执行。'));
+                                            }
                                             $now = date('Y-m-d H:i:s');
-                                            foreach (($fresh['result'] ?? []) as $fr) {
+                                            foreach ($freshRows as $fr) {
                                                 if (!is_array($fr)) {
                                                     continue;
                                                 }
@@ -5244,17 +5320,33 @@ if($_POST['action'] == 'replace_ns_group' && isset($_POST['subdomain_id'])) {
             throw new \RuntimeException('provider unavailable');
         }
         $client = $context['client'];
+        $providerType = strtolower(trim((string) ($context['account']['provider_type'] ?? ($context['provider_type'] ?? ''))));
         $zoneId = $sub->cloudflare_zone_id ?: ($sub->rootdomain ?? '');
         if ($zoneId === '') {
             throw new \RuntimeException('zone missing');
         }
         $targetDomain = strtolower(trim((string) ($sub->subdomain ?? '')));
-        $remote = $client->getDnsRecords($zoneId, null, ['per_page' => 1000]);
+        $defaultPerPage = in_array($providerType, ['powerdns', 'pdns'], true) ? 500 : 1000;
+        $listPerPage = max(100, min(5000, intval($settings['client_cleanup_remote_scan_per_page'] ?? $defaultPerPage)));
+        $maxProcess = max(100, min(20000, intval($settings['client_cleanup_remote_max_process'] ?? 2000)));
+        $timeBudgetMs = max(500, min(10000, intval($settings['client_cleanup_remote_time_budget_ms'] ?? 4000)));
+        $deadline = microtime(true) + ($timeBudgetMs / 1000.0);
+
+        $remote = $client->getDnsRecords($zoneId, null, ['per_page' => $listPerPage]);
         if (!($remote['success'] ?? false)) {
             throw new \RuntimeException('remote list failed');
         }
         $deletedCount = 0;
+        $processed = 0;
+        $truncated = false;
+        $deletedRemoteIds = [];
+        $deletedRemoteTuples = [];
         foreach (($remote['result'] ?? []) as $record) {
+            if ($processed >= $maxProcess || microtime(true) >= $deadline) {
+                $truncated = true;
+                break;
+            }
+            $processed++;
             $recordName = strtolower(trim((string) ($record['name'] ?? '')));
             if (!self::recordBelongsToDomain($recordName, $targetDomain)) {
                 continue;
@@ -5272,13 +5364,55 @@ if($_POST['action'] == 'replace_ns_group' && isset($_POST['subdomain_id'])) {
                 continue;
             }
             $deletedCount++;
-        }
-        try {
-            Capsule::table('mod_cloudflare_dns_records')->where('subdomain_id', intval($sub->id ?? 0))->delete();
-            if (class_exists('CfSubdomainService')) {
-                CfSubdomainService::syncDnsHistoryFlag((int) $sub->id);
+            if ($recordId !== '') {
+                $deletedRemoteIds[$recordId] = true;
             }
-        } catch (\Throwable $e) {}
+            $tupleKey = strtolower(trim((string) ($record['name'] ?? ''))) . '|' . strtoupper(trim((string) ($record['type'] ?? ''))) . '|' . trim((string) ($record['content'] ?? ''));
+            if ($tupleKey !== '||') {
+                $deletedRemoteTuples[$tupleKey] = [
+                    'name' => strtolower(trim((string) ($record['name'] ?? ''))),
+                    'type' => strtoupper(trim((string) ($record['type'] ?? ''))),
+                    'content' => trim((string) ($record['content'] ?? '')),
+                ];
+            }
+        }
+        if ($truncated && function_exists('cloudflare_subdomain_log')) {
+            cloudflare_subdomain_log('client_orphan_cleanup_truncated', [
+                'subdomain' => (string) ($sub->subdomain ?? ''),
+                'processed' => $processed,
+                'deleted' => $deletedCount,
+                'max_process' => $maxProcess,
+                'time_budget_ms' => $timeBudgetMs,
+                'note' => 'partial run finished; schedule next worker run to continue',
+            ], null, intval($sub->id ?? 0));
+        }
+        if (!$truncated) {
+            try {
+                $subdomainId = intval($sub->id ?? 0);
+                foreach (array_keys($deletedRemoteIds) as $rid) {
+                    Capsule::table('mod_cloudflare_dns_records')
+                        ->where('subdomain_id', $subdomainId)
+                        ->where('record_id', $rid)
+                        ->delete();
+                }
+                foreach ($deletedRemoteTuples as $tuple) {
+                    $q = Capsule::table('mod_cloudflare_dns_records')
+                        ->where('subdomain_id', $subdomainId)
+                        ->where('name', $tuple['name'])
+                        ->where('type', $tuple['type'])
+                        ->where('content', $tuple['content']);
+                    if (!empty($deletedRemoteIds)) {
+                        $q->where(function($w) use ($deletedRemoteIds) {
+                            $w->whereNull('record_id')->orWhereNotIn('record_id', array_keys($deletedRemoteIds));
+                        });
+                    }
+                    $q->delete();
+                }
+                if (class_exists('CfSubdomainService')) {
+                    CfSubdomainService::syncDnsHistoryFlag((int) $sub->id);
+                }
+            } catch (\Throwable $e) {}
+        }
         return $deletedCount;
     }
 

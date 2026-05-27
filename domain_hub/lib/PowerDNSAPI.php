@@ -198,6 +198,17 @@ class PowerDNSAPI
         $this->evictZoneCacheIfNeeded();
     }
 
+    public function getZoneRrsetCount(string $zoneId): int
+    {
+        $zoneName = $this->normalizeZoneName($zoneId);
+        $detail = $this->requestZoneDetail($zoneName, [], true);
+        if (!($detail['success'] ?? false)) {
+            return -1;
+        }
+        $rrsets = $detail['result']['rrsets'] ?? [];
+        return is_array($rrsets) ? count($rrsets) : 0;
+    }
+
     private function touchZoneCacheOrder(string $zoneName): void
     {
         $this->zoneCacheOrder[$zoneName] = microtime(true);

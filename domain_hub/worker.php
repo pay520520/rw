@@ -5949,7 +5949,13 @@ function cfmod_job_cleanup_expired_subdomain_remote($job, array $payload = []): 
                 $zoneThreshold = intval($settings['domain_cleanup_pdns_deep_zone_threshold'] ?? 3000);
                 $zoneThreshold = max(100, min(200000, $zoneThreshold));
                 try {
-                    if (method_exists($cf, 'getZoneDetails')) {
+                    if (method_exists($cf, 'getZoneRrsetCount')) {
+                        $rrsetCount = intval($cf->getZoneRrsetCount((string) $zoneId));
+                        if ($rrsetCount > $zoneThreshold) {
+                            $shouldDeepFallback = false;
+                            $stats['warnings'][] = 'pdns_deep_skipped_large_zone:' . $rrsetCount;
+                        }
+                    } elseif (method_exists($cf, 'getZoneDetails')) {
                         $zoneDetail = $cf->getZoneDetails((string) $zoneId);
                         if (($zoneDetail['success'] ?? false) && isset($zoneDetail['result']['rrsets']) && is_array($zoneDetail['result']['rrsets'])) {
                             $rrsetCount = count($zoneDetail['result']['rrsets']);
@@ -7251,7 +7257,7 @@ function cfmod_job_cleanup_orphan_dns($job, array $payload = []): array {
 }
 
 function cfmod_job_client_cleanup_orphan_dns_remote($job, array $payload = []): array {
-    $stats = ['success' => false, 'deleted' => 0, 'local_deleted' => 0, 'warnings' => []];
+    $stats = ['success' => false, 'deleted' => 0, 'local_deleted' => 0, 'warnings' => [], 'repair_stage' => 'planned'];
     try {
         $subdomainId = intval($payload['subdomain_id'] ?? 0);
         $userid = intval($payload['userid'] ?? 0);
@@ -7268,16 +7274,64 @@ function cfmod_job_client_cleanup_orphan_dns_remote($job, array $payload = []): 
             throw new \RuntimeException('provider unavailable');
         }
         $client = $context['client'];
+        $providerType = strtolower(trim((string) ($context['account']['provider_type'] ?? ($context['provider_type'] ?? ''))));
+        if (in_array($providerType, ['powerdns', 'pdns'], true) && method_exists($client, 'setFullZoneFallbackRrsetThreshold')) {
+            $disableFallbackThreshold = intval($settings['self_heal_pdns_fullzone_fallback_rrset_threshold'] ?? 1);
+            $client->setFullZoneFallbackRrsetThreshold(max(1, $disableFallbackThreshold));
+        }
         $zoneId = $sub->cloudflare_zone_id ?: ($sub->rootdomain ?? '');
         if ($zoneId === '') {
             throw new \RuntimeException('zone missing');
         }
+        $repairAction = 'client_cleanup_orphan_dns_remote';
+        $timeBucketSeconds = max(60, min(3600, intval($settings['client_cleanup_repair_timebucket_seconds'] ?? 300)));
+        $timeBucket = intval(floor(time() / $timeBucketSeconds));
+        $repairId = trim((string) ($payload['repair_id'] ?? ''));
+        if ($repairId === '') {
+            $repairId = sha1($subdomainId . '|' . $repairAction . '|all|' . $timeBucket);
+        }
+        $existingActiveRepair = Capsule::table('mod_cloudflare_jobs')
+            ->where('type', 'client_cleanup_orphan_dns_remote')
+            ->whereIn('status', ['pending', 'running'])
+            ->where('id', '!=', intval($job->id ?? 0))
+            ->whereRaw('JSON_EXTRACT(payload_json, "$.repair_id") = ?', [$repairId])
+            ->exists();
+        if ($existingActiveRepair) {
+            $stats['warnings'][] = 'duplicate_active_repair_skipped';
+            $stats['success'] = true;
+            return $stats;
+        }
+        $repairLockAcquired = cfmod_repair_lock_acquire('client_cleanup_orphan_dns_remote', $repairId);
+        if (!$repairLockAcquired) {
+            $stats['warnings'][] = 'repair_lock_conflict';
+            $stats['success'] = true;
+            return $stats;
+        }
+        $stats['repair_id'] = $repairId;
+        $stats['repair_stage'] = 'planned';
+
+        $maxProcess = max(100, min(50000, intval($settings['client_cleanup_remote_max_process'] ?? 2000)));
+        $timeBudgetMs = max(500, min(30000, intval($settings['client_cleanup_remote_time_budget_ms'] ?? 4000)));
+        $deadline = microtime(true) + ($timeBudgetMs / 1000.0);
+
         $targetDomain = strtolower(trim((string) ($sub->subdomain ?? '')));
-        $remote = $client->getDnsRecords($zoneId, null, ['per_page' => 1000]);
+        $defaultPerPage = in_array($providerType, ['powerdns', 'pdns'], true) ? 500 : 1000;
+        $listPerPage = max(100, min(5000, intval($settings['client_cleanup_remote_scan_per_page'] ?? $defaultPerPage)));
+        $remote = $client->getDnsRecords($zoneId, null, ['per_page' => $listPerPage]);
         if (!($remote['success'] ?? false)) {
             throw new \RuntimeException('remote list failed');
         }
+        $stats['repair_stage'] = 'remote_done';
+        $processed = 0;
+        $truncated = false;
+        $deletedRemoteIds = [];
+        $deletedRemoteTuples = [];
         foreach (($remote['result'] ?? []) as $record) {
+            if ($processed >= $maxProcess || microtime(true) >= $deadline) {
+                $truncated = true;
+                break;
+            }
+            $processed++;
             $recordName = strtolower(trim((string) ($record['name'] ?? '')));
             if (!cfmod_record_belongs_to_target_domain($recordName, $targetDomain)) {
                 continue;
@@ -7294,23 +7348,149 @@ function cfmod_job_client_cleanup_orphan_dns_remote($job, array $payload = []): 
                 continue;
             }
             $stats['deleted']++;
+            if ($recordId !== '') {
+                $deletedRemoteIds[$recordId] = true;
+            }
+            $tupleKey = strtolower(trim((string) ($record['name'] ?? ''))) . '|' . strtoupper(trim((string) ($record['type'] ?? ''))) . '|' . trim((string) ($record['content'] ?? ''));
+            if ($tupleKey !== '||') {
+                $deletedRemoteTuples[$tupleKey] = [
+                    'name' => strtolower(trim((string) ($record['name'] ?? ''))),
+                    'type' => strtoupper(trim((string) ($record['type'] ?? ''))),
+                    'content' => trim((string) ($record['content'] ?? '')),
+                ];
+            }
         }
-        $stats['local_deleted'] = (int) Capsule::table('mod_cloudflare_dns_records')->where('subdomain_id', $subdomainId)->delete();
-        if (class_exists('CfSubdomainService')) {
-            CfSubdomainService::syncDnsHistoryFlag($subdomainId);
+        if ($truncated) {
+            $stats['warnings'][] = 'truncated';
+            $nextPayload = [
+                'subdomain_id' => $subdomainId,
+                'userid' => $userid,
+                'repair_id' => $repairId,
+                'resume' => 1,
+            ];
+            Capsule::table('mod_cloudflare_jobs')->insert([
+                'type' => 'client_cleanup_orphan_dns_remote',
+                'payload_json' => json_encode($nextPayload, JSON_UNESCAPED_UNICODE),
+                'priority' => 15,
+                'status' => 'pending',
+                'attempts' => 0,
+                'next_run_at' => date('Y-m-d H:i:s', time() + 5),
+                'created_at' => date('Y-m-d H:i:s'),
+                'updated_at' => date('Y-m-d H:i:s'),
+            ]);
+            if (class_exists('CfQueueTriggerService')) {
+                CfQueueTriggerService::trigger();
+            }
+        } else {
+            // 精确清理：仅清理已确认远端删除的本地记录
+            foreach (array_keys($deletedRemoteIds) as $rid) {
+                $stats['local_deleted'] += (int) Capsule::table('mod_cloudflare_dns_records')
+                    ->where('subdomain_id', $subdomainId)
+                    ->where('record_id', $rid)
+                    ->delete();
+            }
+            foreach ($deletedRemoteTuples as $tuple) {
+                $q = Capsule::table('mod_cloudflare_dns_records')
+                    ->where('subdomain_id', $subdomainId)
+                    ->where('name', $tuple['name'])
+                    ->where('type', $tuple['type'])
+                    ->where('content', $tuple['content']);
+                if (!empty($deletedRemoteIds)) {
+                    $q->where(function($w) use ($deletedRemoteIds) {
+                        $w->whereNull('record_id')->orWhereNotIn('record_id', array_keys($deletedRemoteIds));
+                    });
+                }
+                $stats['local_deleted'] += (int) $q->delete();
+            }
+            if (class_exists('CfSubdomainService')) {
+                CfSubdomainService::syncDnsHistoryFlag($subdomainId);
+            }
         }
+        $stats['repair_stage'] = 'local_done';
         if (function_exists('cloudflare_subdomain_log')) {
             cloudflare_subdomain_log('client_cleanup_orphan_dns_remote', [
                 'domain' => $sub->subdomain ?? '',
                 'remote_deleted' => $stats['deleted'],
                 'local_deleted' => $stats['local_deleted'],
+                'repair_id' => $repairId,
+                'repair_stage' => $stats['repair_stage'],
+                'processed' => $processed,
+                'truncated' => $truncated ? 1 : 0,
             ], $userid, $subdomainId);
         }
+        $stats['repair_stage'] = 'verified';
         $stats['success'] = true;
     } catch (\Throwable $e) {
         $stats['warnings'][] = $e->getMessage();
+    } finally {
+        if (!empty($repairId ?? '')) {
+            cfmod_repair_lock_release('client_cleanup_orphan_dns_remote', (string) $repairId);
+        }
     }
     return $stats;
+}
+
+function cfmod_repair_lock_ensure_table(): bool {
+    static $ready = null;
+    if ($ready !== null) {
+        return $ready;
+    }
+    try {
+        if (!Capsule::schema()->hasTable('mod_cloudflare_repair_locks')) {
+            Capsule::schema()->create('mod_cloudflare_repair_locks', function ($table) {
+                $table->increments('id');
+                $table->string('lock_type', 64);
+                $table->string('repair_id', 64);
+                $table->tinyInteger('status_active')->default(1);
+                $table->dateTime('created_at')->nullable();
+                $table->dateTime('updated_at')->nullable();
+                $table->unique(['lock_type', 'repair_id', 'status_active'], 'uniq_cf_repair_lock_active');
+                $table->index(['lock_type', 'repair_id'], 'idx_cf_repair_lock_lookup');
+            });
+        }
+        $ready = true;
+    } catch (\Throwable $e) {
+        $ready = false;
+    }
+    return $ready;
+}
+
+function cfmod_repair_lock_acquire(string $lockType, string $repairId): bool {
+    if ($lockType === '' || $repairId === '') {
+        return false;
+    }
+    if (!cfmod_repair_lock_ensure_table()) {
+        return true;
+    }
+    try {
+        Capsule::table('mod_cloudflare_repair_locks')->insert([
+            'lock_type' => $lockType,
+            'repair_id' => $repairId,
+            'status_active' => 1,
+            'created_at' => date('Y-m-d H:i:s'),
+            'updated_at' => date('Y-m-d H:i:s'),
+        ]);
+        return true;
+    } catch (\Throwable $e) {
+        return false;
+    }
+}
+
+function cfmod_repair_lock_release(string $lockType, string $repairId): void {
+    if ($lockType === '' || $repairId === '' || !cfmod_repair_lock_ensure_table()) {
+        return;
+    }
+    try {
+        Capsule::table('mod_cloudflare_repair_locks')
+            ->where('lock_type', $lockType)
+            ->where('repair_id', $repairId)
+            ->where('status_active', 1)
+            ->update([
+                'status_active' => 0,
+                'updated_at' => date('Y-m-d H:i:s'),
+            ]);
+    } catch (\Throwable $e) {
+    }
 }
 
 function cfmod_job_ban_user_frontend_like_dns_cleanup_remote($job, array $payload = []): array {
