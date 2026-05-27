@@ -7284,6 +7284,17 @@ function cfmod_job_client_cleanup_orphan_dns_remote($job, array $payload = []): 
         if ($repairId === '') {
             $repairId = sha1($subdomainId . '|' . $repairAction . '|all|' . $timeBucket);
         }
+        $existingActiveRepair = Capsule::table('mod_cloudflare_jobs')
+            ->where('type', 'client_cleanup_orphan_dns_remote')
+            ->whereIn('status', ['pending', 'running'])
+            ->where('id', '!=', intval($job->id ?? 0))
+            ->whereRaw('JSON_EXTRACT(payload_json, "$.repair_id") = ?', [$repairId])
+            ->exists();
+        if ($existingActiveRepair) {
+            $stats['warnings'][] = 'duplicate_active_repair_skipped';
+            $stats['success'] = true;
+            return $stats;
+        }
         $stats['repair_id'] = $repairId;
         $stats['repair_stage'] = 'planned';
 
@@ -7292,7 +7303,8 @@ function cfmod_job_client_cleanup_orphan_dns_remote($job, array $payload = []): 
         $deadline = microtime(true) + ($timeBudgetMs / 1000.0);
 
         $targetDomain = strtolower(trim((string) ($sub->subdomain ?? '')));
-        $remote = $client->getDnsRecords($zoneId, null, ['per_page' => 1000]);
+        $listPerPage = max(100, min(5000, intval($settings['client_cleanup_remote_scan_per_page'] ?? 1000)));
+        $remote = $client->getDnsRecords($zoneId, null, ['per_page' => $listPerPage]);
         if (!($remote['success'] ?? false)) {
             throw new \RuntimeException('remote list failed');
         }

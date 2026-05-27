@@ -4172,6 +4172,13 @@ if($_POST['action'] == "update_dns" && isset($_POST['subdomain_id'])) {
                                     }
 
                                     try {
+                                        $providerType = strtolower(trim((string) ($providerContext['account']['provider_type'] ?? ($providerContext['provider_type'] ?? ''))));
+                                        $isPdnsProvider = ($providerType === 'powerdns' || $providerType === 'pdns')
+                                            || (is_object($cf) && stripos(get_class($cf), 'powerdns') !== false);
+                                        if ($isPdnsProvider && method_exists($cf, 'setFullZoneFallbackRrsetThreshold')) {
+                                            $fallbackThreshold = max(1, intval($module_settings['self_heal_pdns_fullzone_fallback_rrset_threshold'] ?? 1));
+                                            $cf->setFullZoneFallbackRrsetThreshold($fallbackThreshold);
+                                        }
                                         $fresh = $cf->getDnsRecords($record->cloudflare_zone_id, $record->subdomain);
                                         if (($fresh['success'] ?? false)) {
                                             $driftThreshold = max(50, min(5000, intval($module_settings['self_heal_max_remote_records_per_sync'] ?? 200)));
@@ -5330,6 +5337,8 @@ if($_POST['action'] == 'replace_ns_group' && isset($_POST['subdomain_id'])) {
         $deletedCount = 0;
         $processed = 0;
         $truncated = false;
+        $deletedRemoteIds = [];
+        $deletedRemoteTuples = [];
         foreach (($remote['result'] ?? []) as $record) {
             if ($processed >= $maxProcess || microtime(true) >= $deadline) {
                 $truncated = true;
@@ -5353,6 +5362,17 @@ if($_POST['action'] == 'replace_ns_group' && isset($_POST['subdomain_id'])) {
                 continue;
             }
             $deletedCount++;
+            if ($recordId !== '') {
+                $deletedRemoteIds[$recordId] = true;
+            }
+            $tupleKey = strtolower(trim((string) ($record['name'] ?? ''))) . '|' . strtoupper(trim((string) ($record['type'] ?? ''))) . '|' . trim((string) ($record['content'] ?? ''));
+            if ($tupleKey !== '||') {
+                $deletedRemoteTuples[$tupleKey] = [
+                    'name' => strtolower(trim((string) ($record['name'] ?? ''))),
+                    'type' => strtoupper(trim((string) ($record['type'] ?? ''))),
+                    'content' => trim((string) ($record['content'] ?? '')),
+                ];
+            }
         }
         if ($truncated && function_exists('cloudflare_subdomain_log')) {
             cloudflare_subdomain_log('client_orphan_cleanup_truncated', [
@@ -5366,7 +5386,26 @@ if($_POST['action'] == 'replace_ns_group' && isset($_POST['subdomain_id'])) {
         }
         if (!$truncated) {
             try {
-                Capsule::table('mod_cloudflare_dns_records')->where('subdomain_id', intval($sub->id ?? 0))->delete();
+                $subdomainId = intval($sub->id ?? 0);
+                foreach (array_keys($deletedRemoteIds) as $rid) {
+                    Capsule::table('mod_cloudflare_dns_records')
+                        ->where('subdomain_id', $subdomainId)
+                        ->where('record_id', $rid)
+                        ->delete();
+                }
+                foreach ($deletedRemoteTuples as $tuple) {
+                    $q = Capsule::table('mod_cloudflare_dns_records')
+                        ->where('subdomain_id', $subdomainId)
+                        ->where('name', $tuple['name'])
+                        ->where('type', $tuple['type'])
+                        ->where('content', $tuple['content']);
+                    if (!empty($deletedRemoteIds)) {
+                        $q->where(function($w) use ($deletedRemoteIds) {
+                            $w->whereNull('record_id')->orWhereNotIn('record_id', array_keys($deletedRemoteIds));
+                        });
+                    }
+                    $q->delete();
+                }
                 if (class_exists('CfSubdomainService')) {
                     CfSubdomainService::syncDnsHistoryFlag((int) $sub->id);
                 }
