@@ -2856,11 +2856,17 @@ function domain_hub_config() {
                 "Default" => "yes",
                 "Description" => "开启后，自动清理会删除该子域名下所有DNS记录（含子记录）",
             ],
-            "enable_auto_sync" => [
-                "FriendlyName" => "启用自动同步",
+            "enable_cron_scheduler" => [
+                "FriendlyName" => "启用插件调度器（总开关）",
                 "Type" => "yesno",
                 "Default" => "yes",
-                "Description" => "是否启用与阿里云DNS的自动同步功能",
+                "Description" => "控制插件 AfterCronJob 调度器总开关：关闭后将停止所有任务入队与 Cron 内联队列执行。",
+            ],
+            "enable_auto_sync" => [
+                "FriendlyName" => "启用自动同步（仅校准/同步任务）",
+                "Type" => "yesno",
+                "Default" => "yes",
+                "Description" => "仅控制校准/同步类任务（如 calibrate_all）是否自动入队，不影响其他清理、通知、补偿等任务。",
             ],
             "dns_conflict_auto_repair_enabled" => [
                 "FriendlyName" => "DNS 冲突自动修复",
