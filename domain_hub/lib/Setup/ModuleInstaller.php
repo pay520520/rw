@@ -593,6 +593,7 @@ class CfModuleInstaller
                 if (!Capsule::schema()->hasTable('mod_cloudflare_dns_records')) {
                     Capsule::schema()->create('mod_cloudflare_dns_records', function ($table) {
                         $table->increments('id');
+                        $table->unsignedBigInteger('public_id_12')->nullable();
                         $table->integer('subdomain_id')->unsigned();
                         $table->string('zone_id', 50);
                         $table->string('record_id', 50); // Cloudflare 返回的记录ID
@@ -606,10 +607,21 @@ class CfModuleInstaller
                         $table->integer('priority')->nullable(); // 用于MX等记录
                         $table->timestamps();
                         $table->index('subdomain_id');
+                        $table->unique('public_id_12', 'uniq_cf_dns_records_public_id_12');
                         $table->index('record_id');
                         $table->index('name');
                         $table->index('type');
                     });
+                }
+                if (Capsule::schema()->hasTable('mod_cloudflare_dns_records')) {
+                    if (!Capsule::schema()->hasColumn('mod_cloudflare_dns_records', 'public_id_12')) {
+                        Capsule::schema()->table('mod_cloudflare_dns_records', function ($table) {
+                            $table->unsignedBigInteger('public_id_12')->nullable()->after('id');
+                        });
+                    }
+                    if (!cf_index_exists('mod_cloudflare_dns_records', 'uniq_cf_dns_records_public_id_12')) {
+                        Capsule::statement('ALTER TABLE `mod_cloudflare_dns_records` ADD UNIQUE INDEX `uniq_cf_dns_records_public_id_12` (`public_id_12`)');
+                    }
                 }
         
                 // 队列表（如果不存在）

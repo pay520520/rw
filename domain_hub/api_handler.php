@@ -269,6 +269,69 @@ function api_assign_new_subdomain_public_id(int $internalId): int
     return api_get_or_create_public_subdomain_id($internalId, false);
 }
 
+function api_has_public_dns_record_id_column(): bool
+{
+    static $checked = null;
+    if ($checked !== null) {
+        return $checked;
+    }
+    try {
+        $checked = Capsule::schema()->hasTable('mod_cloudflare_dns_records')
+            && Capsule::schema()->hasColumn('mod_cloudflare_dns_records', 'public_id_12');
+    } catch (\Throwable $e) {
+        $checked = false;
+    }
+    return $checked;
+}
+
+function api_generate_public_dns_record_id(int $length = 12): int
+{
+    $length = max(12, min(18, $length));
+    $firstDigit = random_int(1, 9);
+    $digits = (string) $firstDigit;
+    for ($i = 1; $i < $length; $i++) {
+        $digits .= (string) random_int(0, 9);
+    }
+    return (int) $digits;
+}
+
+function api_get_or_create_public_dns_record_id(int $internalId): int
+{
+    if ($internalId <= 0 || !api_has_public_dns_record_id_column()) {
+        return 0;
+    }
+    try {
+        $row = Capsule::table('mod_cloudflare_dns_records')->where('id', $internalId)->first(['id', 'public_id_12']);
+    } catch (\Throwable $e) {
+        return 0;
+    }
+    if (!$row) {
+        return 0;
+    }
+    $existing = (int) ($row->public_id_12 ?? 0);
+    if ($existing > 0) {
+        return $existing;
+    }
+    for ($attempt = 0; $attempt < 6; $attempt++) {
+        $candidate = api_generate_public_dns_record_id(12);
+        try {
+            $updated = Capsule::table('mod_cloudflare_dns_records')
+                ->where('id', $internalId)
+                ->whereNull('public_id_12')
+                ->update(['public_id_12' => $candidate, 'updated_at' => date('Y-m-d H:i:s')]);
+            if ($updated) {
+                return $candidate;
+            }
+            $latest = Capsule::table('mod_cloudflare_dns_records')->where('id', $internalId)->value('public_id_12');
+            if (is_numeric($latest) && (int) $latest > 0) {
+                return (int) $latest;
+            }
+        } catch (\Throwable $e) {
+        }
+    }
+    return 0;
+}
+
 function api_resolve_subdomain_identifier($rawId): int
 {
     return CfSubdomainIdResolver::resolveToInternal($rawId);
@@ -1020,6 +1083,15 @@ function api_resolve_dns_record_identifier(array $data): array {
         }
     }
     $localId = intval($data['id'] ?? 0);
+    if ($recordIdentifier === null) {
+        $publicRaw = $data['public_id_12'] ?? null;
+        if ($publicRaw !== null && !is_array($publicRaw)) {
+            $publicVal = trim((string) $publicRaw);
+            if ($publicVal !== '' && ctype_digit($publicVal)) {
+                $recordIdentifier = $publicVal;
+            }
+        }
+    }
     return [$recordIdentifier, $localId];
 }
 
@@ -1034,6 +1106,12 @@ function api_find_dns_record_by_identifier(?string $recordIdentifier, int $local
     }
 
     if ($recordIdentifier !== null) {
+        if (api_has_public_dns_record_id_column() && ctype_digit($recordIdentifier)) {
+            $rec = Capsule::table('mod_cloudflare_dns_records')->where('public_id_12', intval($recordIdentifier))->first();
+            if ($rec) {
+                return $rec;
+            }
+        }
         $rec = Capsule::table('mod_cloudflare_dns_records')->where('record_id', $recordIdentifier)->first();
         if ($rec) {
             return $rec;
@@ -1215,7 +1293,11 @@ function api_handle_subdomain_get(array $data, $keyRow): array {
     $rows = [];
     foreach ($records as $record) {
         $rows[] = [
-            'id' => intval($record->id),
+            'id' => (function () use ($record) {
+                $publicId = api_get_or_create_public_dns_record_id((int) ($record->id ?? 0));
+                return $publicId > 0 ? $publicId : intval($record->id);
+            })(),
+            'internal_id' => intval($record->id),
             'record_id' => $record->record_id,
             'name' => $record->name,
             'type' => $record->type,
