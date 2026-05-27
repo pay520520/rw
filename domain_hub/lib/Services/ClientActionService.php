@@ -3899,7 +3899,17 @@ if($_POST['action'] == "update_dns" && isset($_POST['subdomain_id'])) {
                                 ->where('record_id', $record_id)
                                 ->first();
                         } elseif ($record_name) {
-                            $fullName = $record_name === '@' ? $record->subdomain : ($record_name . '.' . $record->subdomain);
+                            $normalizedRecordName = strtolower(trim((string) $record_name));
+                            $normalizedSubdomain = strtolower(trim((string) $record->subdomain));
+                            if ($normalizedRecordName === '' || $normalizedRecordName === '@') {
+                                $fullName = $record->subdomain;
+                            } elseif ($normalizedSubdomain !== '' && $normalizedRecordName === $normalizedSubdomain) {
+                                $fullName = $record->subdomain;
+                            } elseif ($normalizedSubdomain !== '' && substr($normalizedRecordName, -strlen('.' . $normalizedSubdomain)) === '.' . $normalizedSubdomain) {
+                                $fullName = $normalizedRecordName;
+                            } else {
+                                $fullName = $record_name . '.' . $record->subdomain;
+                            }
                             $targetRecord = Capsule::table('mod_cloudflare_dns_records')
                                 ->where('subdomain_id', $subdomain_id)
                                 ->where('name', $fullName)
@@ -3912,7 +3922,17 @@ if($_POST['action'] == "update_dns" && isset($_POST['subdomain_id'])) {
                                 $msg = $providerError;
                                 $msg_type = 'danger';
                             } else {
-                                $newFullName = ($record_name === '@') ? $record->subdomain : ($record_name . '.' . $record->subdomain);
+                                $normalizedRecordName = strtolower(trim((string) $record_name));
+                                $normalizedSubdomain = strtolower(trim((string) $record->subdomain));
+                                if ($normalizedRecordName === '' || $normalizedRecordName === '@') {
+                                    $newFullName = $record->subdomain;
+                                } elseif ($normalizedSubdomain !== '' && $normalizedRecordName === $normalizedSubdomain) {
+                                    $newFullName = $record->subdomain;
+                                } elseif ($normalizedSubdomain !== '' && substr($normalizedRecordName, -strlen('.' . $normalizedSubdomain)) === '.' . $normalizedSubdomain) {
+                                    $newFullName = $normalizedRecordName;
+                                } else {
+                                    $newFullName = $record_name . '.' . $record->subdomain;
+                                }
                                 $caa_content = null;
                                 $finalContentForCompare = $record_content;
 

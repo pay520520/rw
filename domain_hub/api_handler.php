@@ -1061,6 +1061,27 @@ function api_resolve_record_name_for_subdomain(string $rawName, string $fullSubd
     return strtolower($name . '.' . $fullSubdomain);
 }
 
+function api_to_relative_record_name(string $name, string $fullSubdomain): string
+{
+    $normalizedName = strtolower(trim($name));
+    $normalizedSubdomain = strtolower(trim($fullSubdomain));
+    if ($normalizedName === '' || $normalizedName === '@') {
+        return '@';
+    }
+    if ($normalizedSubdomain === '') {
+        return $normalizedName;
+    }
+    if ($normalizedName === $normalizedSubdomain) {
+        return '@';
+    }
+    $suffix = '.' . $normalizedSubdomain;
+    if (substr($normalizedName, -strlen($suffix)) === $suffix) {
+        $label = substr($normalizedName, 0, -strlen($suffix));
+        return $label !== '' ? $label : '@';
+    }
+    return $normalizedName;
+}
+
 function api_build_dns_content_for_type(string $type, array $data, string $existingContent = ''): array {
     $type = strtoupper(trim($type));
     $contentInput = isset($data['content']) ? trim((string) $data['content']) : '';
@@ -3270,12 +3291,13 @@ function handleApiRequest(){
                                                 $code = 500;
                                                 $result = ['error' => 'provider unavailable'];
                                             } else {
+                                                $adapterRecordName = api_to_relative_record_name($targetName, (string) $s->subdomain);
                                                 $adapterPayload = [
                                                     'subdomain_id' => $sid,
                                                     'record_id' => $rec->record_id ?? null,
                                                     'id' => intval($rec->id ?? 0),
                                                     'record_type' => $targetType,
-                                                    'record_name' => $targetName === (string)$s->subdomain ? '@' : $targetName,
+                                                    'record_name' => $adapterRecordName,
                                                     'record_content' => $targetContent,
                                                     'record_ttl' => $ttlValue,
                                                     'record_priority' => $priorityValue,
