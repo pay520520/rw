@@ -1084,6 +1084,16 @@ function api_resolve_dns_record_identifier(array $data): array {
     }
     $localId = intval($data['id'] ?? 0);
     if ($recordIdentifier === null) {
+        $idRaw = $data['id'] ?? null;
+        if ($idRaw !== null && !is_array($idRaw)) {
+            $idText = trim((string) $idRaw);
+            if ($idText !== '' && ctype_digit($idText)) {
+                // 兼容：当客户端仅传 id 时，id 可能是新 public_id_12，也可能是旧本地自增 id
+                $recordIdentifier = $idText;
+            }
+        }
+    }
+    if ($recordIdentifier === null) {
         $publicRaw = $data['public_id_12'] ?? null;
         if ($publicRaw !== null && !is_array($publicRaw)) {
             $publicVal = trim((string) $publicRaw);
@@ -1102,6 +1112,12 @@ function api_find_dns_record_by_identifier(?string $recordIdentifier, int $local
         $rec = Capsule::table('mod_cloudflare_dns_records')->where('id', $localId)->first();
         if ($rec) {
             return $rec;
+        }
+        if (api_has_public_dns_record_id_column()) {
+            $rec = Capsule::table('mod_cloudflare_dns_records')->where('public_id_12', $localId)->first();
+            if ($rec) {
+                return $rec;
+            }
         }
     }
 
