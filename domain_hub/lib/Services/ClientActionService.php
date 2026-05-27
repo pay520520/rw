@@ -4174,8 +4174,22 @@ if($_POST['action'] == "update_dns" && isset($_POST['subdomain_id'])) {
                                     try {
                                         $fresh = $cf->getDnsRecords($record->cloudflare_zone_id, $record->subdomain);
                                         if (($fresh['success'] ?? false)) {
+                                            $driftThreshold = max(50, min(5000, intval($module_settings['self_heal_max_remote_records_per_sync'] ?? 200)));
+                                            $freshRows = is_array($fresh['result'] ?? null) ? $fresh['result'] : [];
+                                            if (count($freshRows) > $driftThreshold) {
+                                                $queuedJobId = self::enqueueAsyncDnsJob(intval($userid ?? 0), 'update_dns');
+                                                if (function_exists('cloudflare_subdomain_log')) {
+                                                    cloudflare_subdomain_log('client_update_dns_self_heal_drift_threshold', [
+                                                        'subdomain_id' => $subdomain_id,
+                                                        'remote_count' => count($freshRows),
+                                                        'threshold' => $driftThreshold,
+                                                        'queued_job_id' => $queuedJobId,
+                                                    ], $userid, $subdomain_id);
+                                                }
+                                                throw new Exception(self::actionText('dns.async.queued', '操作已提交到后台队列，将在稍后自动执行。'));
+                                            }
                                             $now = date('Y-m-d H:i:s');
-                                            foreach (($fresh['result'] ?? []) as $fr) {
+                                            foreach ($freshRows as $fr) {
                                                 if (!is_array($fr)) {
                                                     continue;
                                                 }
