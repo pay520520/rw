@@ -26,6 +26,8 @@ class PowerDNSAPI
     private $rateLimitPerMinute = 0;
     private $lastRequestAtMicro = 0.0;
     private $fullZoneFallbackRrsetThreshold = 3000;
+    private $targetedFailureStreak = 0;
+    private $targetedFallbackFailureThreshold = 2;
 
     /**
      * @param string $api_url PowerDNS API base URL (e.g., http://localhost:8081/api/v1)
@@ -189,6 +191,11 @@ class PowerDNSAPI
     public function setFullZoneFallbackRrsetThreshold(int $threshold): void
     {
         $this->fullZoneFallbackRrsetThreshold = max(0, $threshold);
+    }
+
+    public function setTargetedFallbackFailureThreshold(int $threshold): void
+    {
+        $this->targetedFallbackFailureThreshold = max(1, min(10, $threshold));
     }
 
     public function setZoneCacheLimits(int $maxEntries, int $maxRrsets): void
@@ -372,6 +379,7 @@ class PowerDNSAPI
         $typeNormalized = $type ? strtoupper($type) : null;
 
         if ($recordNameNormalized === null) {
+            $this->targetedFailureStreak = 0;
             return $this->requestZoneDetail($zoneName, [], true);
         }
 
@@ -388,6 +396,7 @@ class PowerDNSAPI
             $res = $this->requestZoneDetail($zoneName, $query, false);
             if ($res['success'] ?? false) {
                 $this->supportsRrsetFilter = true;
+                $this->targetedFailureStreak = 0;
                 return $res;
             }
             if ($this->supportsRrsetFilter === null && $this->shouldRetryWithoutRrsetFilter($res)) {
@@ -402,6 +411,7 @@ class PowerDNSAPI
             foreach ($this->buildSearchCandidates($recordNameNormalized) as $candidate) {
                 $search = $this->searchZoneRrsets($zoneName, $candidate, $typeNormalized, $searchLimit, true, true);
                 if ($search['success'] ?? false) {
+                    $this->targetedFailureStreak = 0;
                     if ($candidate !== $recordNameNormalized) {
                         $filtered = [];
                         foreach (($search['result']['rrsets'] ?? []) as $rrset) {
@@ -425,6 +435,14 @@ class PowerDNSAPI
             if (is_array($lastSearchFailure) && !empty($lastSearchFailure)) {
                 $search = $lastSearchFailure;
             }
+        }
+
+        if (!$this->shouldAllowFullZoneFallbackForTargetedFailure($search ?? [])) {
+            $errors = ['full_zone_disabled' => 'full zone fallback blocked by targeted failure policy'];
+            if ($searchUnavailable) {
+                $errors['search_unavailable'] = 'PowerDNS search-data endpoint unavailable';
+            }
+            return ['success' => false, 'errors' => $errors];
         }
 
         if ($this->shouldSkipFullZoneFallbackByThreshold($zoneName)) {
@@ -465,6 +483,57 @@ class PowerDNSAPI
         }
 
         return $fullZone;
+    }
+
+    private function shouldAllowFullZoneFallbackForTargetedFailure(array $failure): bool
+    {
+        if (empty($failure)) {
+            return true;
+        }
+        if ($failure['success'] ?? false) {
+            $this->targetedFailureStreak = 0;
+            return true;
+        }
+        if (!$this->isWhitelistedTargetedFailure($failure)) {
+            $this->targetedFailureStreak = 0;
+            return false;
+        }
+        $this->targetedFailureStreak++;
+        return $this->targetedFailureStreak >= $this->targetedFallbackFailureThreshold;
+    }
+
+    private function isWhitelistedTargetedFailure(array $failure): bool
+    {
+        $code = (int) ($failure['http_code'] ?? 0);
+        if (in_array($code, [408, 429, 500, 502, 503, 504], true)) {
+            return true;
+        }
+        $errors = $failure['errors'] ?? [];
+        if (!is_array($errors) || empty($errors)) {
+            return false;
+        }
+        $blob = strtolower((string) json_encode($errors, JSON_UNESCAPED_UNICODE));
+        if ($blob === '') {
+            return false;
+        }
+        foreach ([
+            'timeout',
+            'timed out',
+            'rate limit',
+            'too many requests',
+            'temporarily unavailable',
+            'connection reset',
+            'econnreset',
+            'broken pipe',
+            'upstream',
+            'gateway',
+            'server error',
+        ] as $token) {
+            if (strpos($blob, $token) !== false) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private function searchZoneRrsets(string $zoneName, string $recordName, ?string $type = null, int $limit = 500, bool $strictNameMatch = true, bool $matchSubtree = false): array
