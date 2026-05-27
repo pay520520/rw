@@ -332,6 +332,16 @@ function api_get_or_create_public_dns_record_id(int $internalId): int
     return 0;
 }
 
+function api_public_dns_record_id_or_fallback($record): int
+{
+    $internalId = intval($record->id ?? 0);
+    if ($internalId <= 0) {
+        return 0;
+    }
+    $publicId = api_get_or_create_public_dns_record_id($internalId);
+    return $publicId > 0 ? $publicId : $internalId;
+}
+
 function api_resolve_subdomain_identifier($rawId): int
 {
     return CfSubdomainIdResolver::resolveToInternal($rawId);
@@ -1309,11 +1319,7 @@ function api_handle_subdomain_get(array $data, $keyRow): array {
     $rows = [];
     foreach ($records as $record) {
         $rows[] = [
-            'id' => (function () use ($record) {
-                $publicId = api_get_or_create_public_dns_record_id((int) ($record->id ?? 0));
-                return $publicId > 0 ? $publicId : intval($record->id);
-            })(),
-            'internal_id' => intval($record->id),
+            'id' => api_public_dns_record_id_or_fallback($record),
             'record_id' => $record->record_id,
             'name' => $record->name,
             'type' => $record->type,
@@ -3058,7 +3064,7 @@ function handleApiRequest(){
                     $nextCursor = $cursor;
                     foreach ($recsLimited as $r) {
                         $fieldValues = [
-                            'id' => intval($r->id ?? 0),
+                            'id' => api_public_dns_record_id_or_fallback($r),
                             'record_id' => $r->record_id ?? null,
                             'name' => $r->name ?? null,
                             'type' => $r->type ?? null,
@@ -3187,7 +3193,7 @@ function handleApiRequest(){
                                         $result = [
                                             'success' => true,
                                             'message' => 'DNS record created successfully',
-                                            'id' => intval($latest->id ?? 0),
+                                            'id' => api_public_dns_record_id_or_fallback($latest),
                                             'record_id' => $latest->record_id ?? null,
                                         ];
                                     } else {
@@ -3253,7 +3259,7 @@ function handleApiRequest(){
                                 $adapterPayload = [
                                     'subdomain_id' => $sid,
                                     'record_id' => $rec->record_id ?? null,
-                                    'id' => intval($rec->id ?? 0),
+                                    'id' => api_public_dns_record_id_or_fallback($rec),
                                 ];
                                 list($adapterCode, $adapterResult) = api_execute_dns_via_client_core('delete_dns_record', $adapterPayload, intval($keyRow->userid ?? 0), $settings, [
                                     'disableDnsWrite' => api_setting_enabled($settings['disable_dns_write'] ?? '0'),
@@ -3403,7 +3409,7 @@ function handleApiRequest(){
                                                     $result = [
                                                         'success' => true,
                                                         'message' => 'DNS record updated successfully',
-                                                        'id' => intval($latest->id ?? $rec->id),
+                                                        'id' => api_public_dns_record_id_or_fallback($latest ?: $rec),
                                                         'record_id' => $latest->record_id ?? ($rec->record_id ?? null),
                                                     ];
                                                 } else {
