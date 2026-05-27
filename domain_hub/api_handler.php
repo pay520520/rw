@@ -1061,6 +1061,33 @@ function api_resolve_record_name_for_subdomain(string $rawName, string $fullSubd
     return strtolower($name . '.' . $fullSubdomain);
 }
 
+function api_normalize_record_name_input(string $rawName, string $fullSubdomain): array {
+    $fullSubdomain = strtolower(trim($fullSubdomain));
+    $raw = trim($rawName);
+    if ($raw === '' || $raw === '@') {
+        return ['ok' => true, 'relative' => '@', 'full' => $fullSubdomain, 'normalized' => '@'];
+    }
+    $candidate = strtolower(rtrim($raw, '.'));
+    if ($candidate === '') {
+        return ['ok' => false, 'error' => 'invalid name'];
+    }
+    if (strpos($candidate, '.') !== false) {
+        if ($candidate === $fullSubdomain) {
+            return ['ok' => true, 'relative' => '@', 'full' => $fullSubdomain, 'normalized' => '@'];
+        }
+        $suffix = '.' . $fullSubdomain;
+        if (substr($candidate, -strlen($suffix)) !== $suffix) {
+            return ['ok' => false, 'error' => 'name must be @ or a relative label under current subdomain'];
+        }
+        $label = substr($candidate, 0, -strlen($suffix));
+        if ($label === '' || strpos($label, '.') !== false) {
+            return ['ok' => false, 'error' => 'name must be @ or a single relative label'];
+        }
+        return ['ok' => true, 'relative' => $label, 'full' => $label . '.' . $fullSubdomain, 'normalized' => $label];
+    }
+    return ['ok' => true, 'relative' => $candidate, 'full' => $candidate . '.' . $fullSubdomain, 'normalized' => $candidate];
+}
+
 function api_build_dns_content_for_type(string $type, array $data, string $existingContent = ''): array {
     $type = strtoupper(trim($type));
     $contentInput = isset($data['content']) ? trim((string) $data['content']) : '';
@@ -2963,6 +2990,7 @@ function handleApiRequest(){
                             'id' => intval($r->id ?? 0),
                             'record_id' => $r->record_id ?? null,
                             'name' => $r->name ?? null,
+                            'display_name' => (strtolower(trim((string) ($r->name ?? ''))) === strtolower(trim((string) ($s->subdomain ?? '')))) ? '@' : api_extract_subdomain_label((string) ($r->name ?? ''), (string) ($s->subdomain ?? '')),
                             'type' => $r->type ?? null,
                             'content' => $r->content ?? null,
                             'ttl' => intval($r->ttl ?? 0),
@@ -3243,9 +3271,14 @@ function handleApiRequest(){
                                         $result = ['error' => 'no updates specified'];
                                     } else {
                                         $zone = $rec->zone_id ?: ($s->cloudflare_zone_id ?: $s->rootdomain);
-                                        $targetName = array_key_exists('name', $data)
-                                            ? api_resolve_record_name_for_subdomain((string)$data['name'], (string)$s->subdomain)
-                                            : (string)($rec->name ?? $s->subdomain);
+                                            $normalizedName = array_key_exists('name', $data)
+                                                ? api_normalize_record_name_input((string) $data['name'], (string) $s->subdomain)
+                                                : ['ok' => true, 'relative' => ((strtolower(trim((string) ($rec->name ?? ''))) === strtolower(trim((string) ($s->subdomain ?? '')))) ? '@' : api_extract_subdomain_label((string) ($rec->name ?? ''), (string) ($s->subdomain ?? ''))), 'full' => (string) ($rec->name ?? $s->subdomain), 'normalized' => ''];
+                                            if (empty($normalizedName['ok'])) {
+                                                $code = 400;
+                                                $result = ['error' => (string) ($normalizedName['error'] ?? 'invalid name')];
+                                            } else {
+                                            $targetName = (string) ($normalizedName['full'] ?? ($rec->name ?? $s->subdomain));
                                         $ttlValue = array_key_exists('ttl', $data)
                                             ? cfmod_normalize_ttl($data['ttl'])
                                             : cfmod_normalize_ttl($rec->ttl ?? 600);
@@ -3275,7 +3308,7 @@ function handleApiRequest(){
                                                     'record_id' => $rec->record_id ?? null,
                                                     'id' => intval($rec->id ?? 0),
                                                     'record_type' => $targetType,
-                                                    'record_name' => $targetName === (string)$s->subdomain ? '@' : $targetName,
+                                                    'record_name' => (string) ($normalizedName['relative'] ?? '@'),
                                                     'record_content' => $targetContent,
                                                     'record_ttl' => $ttlValue,
                                                     'record_priority' => $priorityValue,
@@ -3310,8 +3343,17 @@ function handleApiRequest(){
                                                     ];
                                                 } else {
                                                     $code = $adapterCode;
-                                                    $result = ['error' => (string)($adapterResult['error'] ?? 'update failed')];
+                                                    $result = [
+                                                        'error' => (string)($adapterResult['error'] ?? 'update failed'),
+                                                        'details' => [
+                                                            'zone_id' => (string) $zone,
+                                                            'normalized_name' => (string) ($normalizedName['full'] ?? ''),
+                                                            'provider_type' => (string) ($providerContext['provider_type'] ?? ''),
+                                                            'resolved_subdomain_id' => (int) $sid,
+                                                        ],
+                                                    ];
                                                 }
+                                            }
                                             }
                                         }
                                     }

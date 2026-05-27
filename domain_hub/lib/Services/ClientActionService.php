@@ -4086,10 +4086,12 @@ if($_POST['action'] == "update_dns" && isset($_POST['subdomain_id'])) {
                                     $targetRecord->line = $line;
                                     $targetRecord->priority = in_array($record_type_upper, ['MX', 'SRV'], true) ? $record_priority : null;
 
+                                    $providerType = strtolower((string) ($providerContext['provider_type'] ?? ''));
                                     if (
                                         $previousRecordId !== ''
                                         && $updatedRecordId !== ''
                                         && $updatedRecordId !== $previousRecordId
+                                        && $providerType !== 'powerdns'
                                         && method_exists($cf, 'deleteSubdomain')
                                     ) {
                                         try {
@@ -4212,6 +4214,40 @@ if($_POST['action'] == "update_dns" && isset($_POST['subdomain_id'])) {
                                     }
                                     $msg_type = "success";
                                 } else {
+                                    $providerErrorText = cfmod_format_provider_error($res['errors'] ?? '');
+                                    $isConflict = stripos($providerErrorText, 'conflict') !== false
+                                        || stripos($providerErrorText, 'exists') !== false
+                                        || stripos($providerErrorText, 'duplicate') !== false
+                                        || stripos($providerErrorText, 'not unique') !== false
+                                        || strpos($providerErrorText, '冲突') !== false
+                                        || strpos($providerErrorText, '已存在') !== false
+                                        || strpos($providerErrorText, '重复') !== false;
+                                    if ($isConflict && class_exists('CfDnsConflictRepairService') && method_exists($cf, 'getDnsRecords')) {
+                                        try {
+                                            $repairRes = CfDnsConflictRepairService::tryRepairViaUpsert(
+                                                $cf,
+                                                (string) $record->cloudflare_zone_id,
+                                                (string) $record_type_upper,
+                                                (string) $newFullName,
+                                                (string) $record_content,
+                                                intval($record_ttl),
+                                                intval($record_priority),
+                                                (string) $line,
+                                                true,
+                                                true
+                                            );
+                                            if (!empty($repairRes['success'])) {
+                                                $msg = self::actionText('dns.update.success', 'DNS记录更新成功！域名解析已更新');
+                                                $msg_type = "success";
+                                                return [
+                                                    'msg' => $msg,
+                                                    'msg_type' => $msg_type,
+                                                    'registerError' => $registerError,
+                                                ];
+                                            }
+                                        } catch (\Throwable $repairEx) {
+                                        }
+                                    }
                                     $errorText = cfmod_format_provider_error($res['errors'] ?? '');
                                     $msg = self::actionText('dns.update.failed', 'DNS记录更新失败：%s', [$errorText]);
                                     $msg_type = "danger";
