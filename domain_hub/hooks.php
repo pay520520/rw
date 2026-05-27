@@ -121,38 +121,47 @@ add_hook('AfterCronJob', 1, function($vars) {
         $settings = [];
         foreach ($rows as $r) { $settings[$r->setting] = $r->value; }
 
-        $enabled = ($settings['enable_auto_sync'] ?? 'on') === 'on' || ($settings['enable_auto_sync'] ?? '1') == '1';
-        if (!$enabled) { return; }
-        $intervalMin = intval($settings['sync_interval'] ?? 60);
-        $intervalMin = max(5, min(999999, $intervalMin));
-
         $now = date('Y-m-d H:i:s');
-        $last = Capsule::table('mod_cloudflare_jobs')
-            ->where('type','calibrate_all')
-            ->orderBy('id','desc')->first();
 
-        $shouldEnqueue = false;
-        if (!$last) { $shouldEnqueue = true; }
-        else {
-            if (in_array($last->status, ['failed','done','cancelled'])) {
-                $lastTime = $last->updated_at ?? $last->created_at;
-                if (!$lastTime || strtotime($lastTime) <= time() - $intervalMin * 60) {
-                    $shouldEnqueue = true;
-                }
-            }
+        // Scheduler master switch: when disabled, stop all enqueue/inline execution.
+        $cronSchedulerEnabled = cfmod_setting_enabled($settings['enable_cron_scheduler'] ?? '1');
+        if (!$cronSchedulerEnabled) {
+            return;
         }
 
-        if ($shouldEnqueue) {
-            Capsule::table('mod_cloudflare_jobs')->insert([
-                'type' => 'calibrate_all',
-                'payload_json' => json_encode(['mode' => 'fix'], JSON_UNESCAPED_UNICODE),
-                'priority' => 10,
-                'status' => 'pending',
-                'attempts' => 0,
-                'next_run_at' => null,
-                'created_at' => $now,
-                'updated_at' => $now
-            ]);
+        // Auto sync switch: only controls calibrate/sync style jobs.
+        $autoSyncEnabled = cfmod_setting_enabled($settings['enable_auto_sync'] ?? '1');
+        if ($autoSyncEnabled) {
+            $intervalMin = intval($settings['sync_interval'] ?? 60);
+            $intervalMin = max(5, min(999999, $intervalMin));
+
+            $last = Capsule::table('mod_cloudflare_jobs')
+                ->where('type','calibrate_all')
+                ->orderBy('id','desc')->first();
+
+            $shouldEnqueue = false;
+            if (!$last) { $shouldEnqueue = true; }
+            else {
+                if (in_array($last->status, ['failed','done','cancelled'])) {
+                    $lastTime = $last->updated_at ?? $last->created_at;
+                    if (!$lastTime || strtotime($lastTime) <= time() - $intervalMin * 60) {
+                        $shouldEnqueue = true;
+                    }
+                }
+            }
+
+            if ($shouldEnqueue) {
+                Capsule::table('mod_cloudflare_jobs')->insert([
+                    'type' => 'calibrate_all',
+                    'payload_json' => json_encode(['mode' => 'fix'], JSON_UNESCAPED_UNICODE),
+                    'priority' => 10,
+                    'status' => 'pending',
+                    'attempts' => 0,
+                    'next_run_at' => null,
+                    'created_at' => $now,
+                    'updated_at' => $now
+                ]);
+            }
         }
 
         // Risk scan enqueue

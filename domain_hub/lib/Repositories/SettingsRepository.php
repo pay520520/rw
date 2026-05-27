@@ -339,6 +339,7 @@ class CfSettingsRepository
             'safe_browsing_scan_batch_size' => '50',
             'enable_client_domain_delete' => '0',
             'client_domain_delete_mode' => 'disabled',
+            'enable_cron_scheduler' => '1',
             'domain_cleanup_interval_hours' => '24',
             'partner_plan_admin_email' => '',
             'invite_registration_gate_mode' => 'disabled',
